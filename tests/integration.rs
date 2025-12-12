@@ -343,6 +343,7 @@ xcb::atoms_struct! {
         win_type_popup_menu => b"_NET_WM_WINDOW_TYPE_POPUP_MENU",
         win_type_dropdown_menu => b"_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
         win_type_tooltip => b"_NET_WM_WINDOW_TYPE_TOOLTIP",
+        win_type_utility => b"_NET_WM_WINDOW_TYPE_UTILITY",
         win_type_dnd => b"_NET_WM_WINDOW_TYPE_DND",
         motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
         mime1 => b"text/plain" only_if_exists = false,
@@ -455,6 +456,12 @@ impl Connection {
     #[track_caller]
     fn map_window(&self, window: x::Window) {
         self.send_and_check_request(&x::MapWindow { window })
+            .unwrap();
+    }
+
+    #[track_caller]
+    fn unmap_window(&self, window: x::Window) {
+        self.send_and_check_request(&x::UnmapWindow { window })
             .unwrap();
     }
 
@@ -706,6 +713,16 @@ fn toplevel_flow() {
     connection.map_window(window);
     f.wait_and_dispatch();
 
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: false,
+        window,
+        property: connection.atoms.wm_state,
+        r#type: connection.atoms.wm_state,
+        long_offset: 0,
+        long_length: 1,
+    });
+    assert_eq!(reply.value::<u32>(), &[WmState::Normal as u32]);
+
     let surface = f
         .testwl
         .last_created_surface_id()
@@ -756,6 +773,27 @@ fn toplevel_flow() {
         data.toplevel().max_size,
         Some(testwl::Vec2 { x: 150, y: 200 })
     );
+
+    connection.unmap_window(window);
+    f.wait_and_dispatch();
+
+    let reply = connection.get_reply(&x::GetProperty {
+        delete: false,
+        window,
+        property: connection.atoms.wm_state,
+        r#type: connection.atoms.wm_state,
+        long_offset: 0,
+        long_length: 1,
+    });
+    assert_eq!(reply.value::<u32>(), &[WmState::Withdrawn as u32]);
+
+    connection.map_window(window);
+    f.wait_and_dispatch();
+    let surface = f
+        .testwl
+        .last_created_surface_id()
+        .expect("No surface created!");
+    f.configure_and_verify_new_toplevel(&mut connection, window, surface);
 
     f.wm_delete_window(&mut connection, window, surface);
 
@@ -1362,7 +1400,6 @@ fn different_output_position() {
     f.testwl.move_pointer_to(surface, 150.0, 12.0);
     f.wait_and_dispatch();
     let reply = connection.get_reply(&x::QueryPointer { window });
-    println!("reply: {reply:?}");
     assert!(reply.same_screen());
     assert_eq!(reply.win_x(), 150);
     assert_eq!(reply.win_y(), 12);
@@ -2003,6 +2040,15 @@ fn popup_heuristics() {
         &[connection.atoms.win_type_dropdown_menu],
     );
     f.map_as_popup(&mut connection, git_gui_dropdown);
+
+    let wechat_popup = connection.new_window(connection.root, 10, 10, 50, 50, true);
+    connection.set_property(
+        wechat_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_utility],
+    );
+    f.map_as_popup(&mut connection, wechat_popup);
 }
 
 #[test]

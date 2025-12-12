@@ -838,6 +838,71 @@ impl TestFixture<FakeXConnection> {
 
         (surface, popup_id)
     }
+
+    #[track_caller]
+    fn assert_window_dimensions(
+        &self,
+        window: x::Window,
+        surface_id: testwl::SurfaceId,
+        dims: WindowDims,
+    ) {
+        let data = self.testwl.get_surface_data(surface_id).unwrap();
+        match data.role {
+            Some(SurfaceRole::Popup(_)) => {
+                assert_eq!(
+                    data.popup().positioner_state.offset,
+                    testwl::Vec2 {
+                        x: dims.x as _,
+                        y: dims.y as _
+                    }
+                );
+                assert_eq!(
+                    data.popup().positioner_state.size,
+                    Some(testwl::Vec2 {
+                        x: dims.width as _,
+                        y: dims.height as _
+                    })
+                );
+                let win_data = &self.connection().windows[&window];
+                assert_eq!(win_data.dims, dims);
+            }
+            Some(SurfaceRole::Toplevel(_)) => {
+                let win_data = self
+                    .satellite
+                    .windows
+                    .get(&window)
+                    .copied()
+                    .and_then(|id| {
+                        let d = self.satellite.world.entity(id).unwrap();
+                        d.get::<&crate::server::WindowData>()
+                    })
+                    .unwrap();
+                assert_eq!(win_data.attrs.dims, dims);
+
+                let viewport = data.viewport.as_ref().expect("Missing viewport");
+                assert_eq!(viewport.width, dims.width as _);
+                assert_eq!(viewport.height, dims.height as _);
+            }
+            ref e => {
+                panic!("tried to assert dimensions of something not a toplevel or popup: {e:?}",);
+            }
+        }
+    }
+
+    fn reconfigure_window(&mut self, window: Window, dims: WindowDims, override_redirect: bool) {
+        self.satellite
+            .reconfigure_window(x::ConfigureNotifyEvent::new(
+                window,
+                window,
+                x::WINDOW_NONE,
+                dims.x,
+                dims.y,
+                dims.width,
+                dims.height,
+                0,
+                override_redirect,
+            ));
+    }
 }
 
 struct TestObjectData<T: Proxy> {
@@ -1646,7 +1711,7 @@ fn output_offset_change() {
 }
 
 #[test]
-fn reposition_popup() {
+fn reconfigure_popup() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let toplevel = unsafe { Window::new(1) };
     let (_, t_id) = f.create_toplevel(&comp, toplevel);
@@ -1654,76 +1719,88 @@ fn reposition_popup() {
     let popup = unsafe { Window::new(2) };
     let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, toplevel, t_id).x(20).y(40));
 
-    f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
-        popup,
-        popup,
-        x::WINDOW_NONE,
-        40,  // x
-        60,  // y
-        80,  // width
-        100, // height
-        0,
-        true,
-    ));
+    let new_dims = WindowDims {
+        x: 40,
+        y: 60,
+        width: 80,
+        height: 100,
+    };
+    f.reconfigure_window(popup, new_dims, true);
     f.run();
     f.run();
-    let data = f.testwl.get_surface_data(p_id).unwrap();
-    assert_eq!(
-        data.popup().positioner_state.offset,
-        testwl::Vec2 { x: 40, y: 60 }
-    );
-    assert_eq!(
-        data.popup().positioner_state.size,
-        Some(testwl::Vec2 { x: 80, y: 100 })
-    );
-    let win_data = &f.connection().windows[&popup];
-    assert_eq!(
-        win_data.dims,
-        WindowDims {
-            x: 40,
-            y: 60,
-            width: 80,
-            height: 100
-        }
-    );
+    f.assert_window_dimensions(popup, p_id, new_dims);
 }
 
 #[test]
-fn toplevel_reconfigure() {
+fn reconfigure_popup_after_map() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let toplevel = unsafe { Window::new(1) };
+    f.create_toplevel(&comp, toplevel);
+
+    let popup = unsafe { Window::new(2) };
+    let old_dims = WindowDims {
+        x: 20,
+        y: 40,
+        width: 10,
+        height: 10,
+    };
+    let new_dims = WindowDims {
+        x: 40,
+        y: 60,
+        width: 80,
+        height: 100,
+    };
+
+    let (buffer, surface) = comp.create_surface();
+    let popup_data = WindowData {
+        mapped: true,
+        dims: old_dims,
+        fullscreen: false,
+    };
+    f.new_window(popup, true, popup_data);
+    f.satellite.map_window(popup);
+    f.reconfigure_window(popup, new_dims, true);
+    f.associate_window(&comp, popup, &surface);
+    f.run();
+    surface
+        .send_request(Req::<WlSurface>::Attach {
+            buffer: Some(buffer.obj.clone()),
+            x: 0,
+            y: 0,
+        })
+        .unwrap();
+    f.run();
+    let p_id = f.check_new_surface();
+    f.testwl.configure_popup(p_id);
+    f.run();
+    f.assert_window_dimensions(popup, p_id, new_dims);
+}
+
+#[test]
+fn reconfigure_toplevel() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let toplevel = unsafe { Window::new(1) };
     let (_, surface) = f.create_toplevel(&comp, toplevel);
 
-    {
-        let data = f
-            .testwl
-            .get_surface_data(surface)
-            .expect("Missing surface data");
-        let viewport = data.viewport.as_ref().expect("Missing viewport");
-        assert_eq!(viewport.width, 100);
-        assert_eq!(viewport.height, 100);
-    }
+    let mut dims = WindowDims {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+    };
+    f.assert_window_dimensions(toplevel, surface, dims);
 
-    f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
-        toplevel,
-        toplevel,
-        x::WINDOW_NONE,
-        0,   // x
-        0,   // y
-        80,  // width
-        100, // height
-        0,
-        true,
-    ));
-
+    dims.width = 80;
+    dims.height = 120;
+    let final_dims = dims;
+    // A toplevel can be resized, but not change position
+    dims.x = 20;
+    dims.y = 20;
+    f.reconfigure_window(toplevel, dims, false);
     f.run();
-    let data = f
-        .testwl
-        .get_surface_data(surface)
-        .expect("Missing surface data");
-    let viewport = data.viewport.as_ref().expect("Missing viewport");
-    assert_eq!(viewport.width, 80);
-    assert_eq!(viewport.height, 100);
+    f.run();
+
+    f.assert_window_dimensions(toplevel, surface, final_dims);
 }
 
 type EventMatcher<'a, Event> = Box<dyn FnMut(&Event) -> bool + 'a>;
@@ -2193,17 +2270,13 @@ fn fractional_scale_small_popup() {
     let pos = &data.popup().positioner_state;
     assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
 
-    f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
-        popup,
-        popup,
-        x::WINDOW_NONE,
-        0,
-        0,
-        2,
-        1,
-        0,
-        true,
-    ));
+    let dims = WindowDims {
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 1,
+    };
+    f.reconfigure_window(popup, dims, true);
     f.run();
     f.run();
 
@@ -2288,6 +2361,17 @@ fn toplevel_size_limits_scaled() {
     let toplevel = data.toplevel();
     assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 20 }));
     assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 100, y: 100 }));
+
+    // test sizing with decorations
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 45 }));
+    assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 100, y: 125 }));
 }
 
 #[test]
@@ -2714,6 +2798,56 @@ fn client_side_decorations_no_global() {
     }
 
     assert_eq!(toplevel.unwrap(), subsurface_parent.unwrap());
+}
+
+#[test]
+fn resize_decorations_on_reconfigure() {
+    let (mut f, compositor) = TestFixture::new_with_compositor();
+    let window = unsafe { Window::new(1) };
+    let (_, id) = f.create_toplevel(&compositor, window);
+    f.testwl
+        .force_decoration_mode(id, zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    f.testwl.configure_toplevel(id, 100, 100, vec![]);
+    f.run();
+
+    let data = f.connection().window(window);
+    assert_eq!(
+        data.dims,
+        WindowDims {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 75
+        }
+    );
+    let subsurface_id = f.testwl.last_created_surface_id().unwrap();
+    assert_ne!(subsurface_id, id);
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let buf_dims = f
+        .testwl
+        .get_buffer_dimensions(data.buffer.as_ref().expect("Missing buffer for subsurface"));
+    assert_eq!(buf_dims, testwl::Vec2 { x: 100, y: 25 });
+    assert!(
+        matches!(data.role, Some(SurfaceRole::Subsurface(_))),
+        "surface was not a subsurface: {:?}",
+        data.role
+    );
+
+    let dims = WindowDims {
+        x: 0,
+        y: 0,
+        width: 200,
+        height: 200,
+    };
+    f.reconfigure_window(window, dims, false);
+    f.run();
+    f.run();
+
+    let data = f.testwl.get_surface_data(subsurface_id).unwrap();
+    let buf_dims = f
+        .testwl
+        .get_buffer_dimensions(data.buffer.as_ref().expect("Missing buffer for subsurface"));
+    assert_eq!(buf_dims, testwl::Vec2 { x: 200, y: 25 });
 }
 
 /// See Pointer::handle_event for an explanation.

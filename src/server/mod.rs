@@ -12,13 +12,15 @@ use crate::{timespec_from_millis, X11Selection, XConnection};
 use clientside::MyWorld;
 use decoration::{DecorationsData, DecorationsDataSatellite};
 use hecs::Entity;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use rustix::event::{poll, PollFd, PollFlags};
+use rustix::fs::Timespec;
 use smithay_client_toolkit::activation::ActivationState;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
 use wayland_client::{
     globals::{registry_queue_init, Global},
@@ -514,9 +516,6 @@ impl<S: X11Selection> ServerState<NoConnection<S>> {
 
         let decoration_manager = global_list
             .bind::<ZxdgDecorationManagerV1, _, _>(&qh, 1..=1, ())
-            .inspect_err(|e| {
-                warn!("Could not bind xdg decoration ({e:?}). Windows might not have decorations.")
-            })
             .ok();
 
         let selection_states = selection::SelectionStates::new(&global_list, &qh);
@@ -656,7 +655,10 @@ impl<C: XConnection> ServerState<C> {
 
                     drop(surface_query);
                     for surface in surfaces {
-                        update_surface_viewport(self.world.query_one(surface).unwrap());
+                        update_surface_viewport(
+                            &self.world,
+                            self.world.query_one(surface).unwrap(),
+                        );
                     }
                 }
             }
@@ -702,9 +704,37 @@ impl<C: XConnection> ServerState<C> {
 
         self.handle_selection_events();
         self.handle_activations();
-        self.queue
-            .flush()
-            .expect("Failed flushing clientside events");
+        if let Err(e) = self.queue.flush() {
+            match e {
+                wayland_client::backend::WaylandError::Io(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    let fd = PollFd::new(&self.queue, PollFlags::OUT);
+                    match poll(
+                        &mut [fd],
+                        Some(&Timespec {
+                            tv_sec: 0,
+                            tv_nsec: Duration::from_millis(50).as_nanos() as _,
+                        }),
+                    ) {
+                        Ok(0) => {
+                            error!("Failed to flush clientside events (timeout)! Will try again later.");
+                        }
+                        Ok(_) => {
+                            self.queue.flush().unwrap();
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to flush clientside events ({e})! Will try again later."
+                            );
+                        }
+                    }
+                }
+                other => {
+                    panic!("Failed flushing clientside events: {other:#?}");
+                }
+            }
+        }
     }
 
     fn close_x_window(&mut self, window: x::Window) {
@@ -851,20 +881,25 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         let mut win = data.get::<&mut WindowData>().unwrap();
 
-        if win.attrs.size_hints.is_none() || *win.attrs.size_hints.as_ref().unwrap() != hints {
+        if win.attrs.size_hints.is_none_or(|h| h != hints) {
             debug!("setting {window:?} hints {hints:?}");
             let mut query = data.query::<(&SurfaceRole, &SurfaceScaleFactor)>();
             if let Some((SurfaceRole::Toplevel(Some(data)), scale_factor)) = query.get() {
+                let decorations_height = if data.decoration.satellite.is_some() {
+                    DecorationsDataSatellite::TITLEBAR_HEIGHT
+                } else {
+                    0
+                };
                 if let Some(min_size) = &hints.min_size {
                     data.toplevel.set_min_size(
                         (min_size.width as f64 / scale_factor.0) as i32,
-                        (min_size.height as f64 / scale_factor.0) as i32,
+                        (min_size.height as f64 / scale_factor.0) as i32 + decorations_height,
                     );
                 }
                 if let Some(max_size) = &hints.max_size {
                     data.toplevel.set_max_size(
                         (max_size.width as f64 / scale_factor.0) as i32,
-                        (max_size.height as f64 / scale_factor.0) as i32,
+                        (max_size.height as f64 / scale_factor.0) as i32 + decorations_height,
                     );
                 }
             }
@@ -941,16 +976,22 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         };
         if dims == win.attrs.dims {
             return;
-        }else{
+        } else if win.attrs.is_popup {
             win.attrs.dims = dims;
         }
+
         debug!("Reconfiguring {:?} {:?}", event.window(), dims);
+
+        if !win.mapped {
+            win.attrs.dims = dims;
+            return;
+        }
 
         if self.xdg_wm_base.version() < 3 {
             return;
         }
 
-        let mut query = data.query::<(&SurfaceRole, &SurfaceScaleFactor)>();
+        let mut query = data.query::<(&mut SurfaceRole, &SurfaceScaleFactor)>();
         let Some((role, scale_factor)) = query.get() else {
             return;
         };
@@ -972,7 +1013,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 win.attrs.dims.height = dims.height;
                 drop(query);
                 drop(win);
-                update_surface_viewport(self.world.query_one(data.entity()).unwrap());
+                update_surface_viewport(&self.world, self.world.query_one(data.entity()).unwrap());
             }
             other => warn!("Non popup ({other:?}) being reconfigured, behavior may be off."),
         }

@@ -113,7 +113,10 @@ impl Event for SurfaceEvents {
                         }
                     }
                     if entity.has::<WindowData>() {
-                        update_surface_viewport(state.world.query_one(target).unwrap());
+                        update_surface_viewport(
+                            &state.world,
+                            state.world.query_one(target).unwrap(),
+                        );
                     }
                 }
                 _ => unreachable!(),
@@ -228,7 +231,10 @@ impl SurfaceEvents {
                         let output_scale = output_data.get::<&OutputScaleFactor>().unwrap().get();
                         data.get::<&mut SurfaceScaleFactor>().unwrap().0 = output_scale;
                         drop(query);
-                        update_surface_viewport(state.world.query_one(target).unwrap());
+                        update_surface_viewport(
+                            &state.world,
+                            state.world.query_one(target).unwrap(),
+                        );
                     } else {
                         let scale = data.get::<&SurfaceScaleFactor>().unwrap();
                         if update_output_scale(
@@ -310,10 +316,10 @@ impl SurfaceEvents {
                 data.get::<&WlSurface>().unwrap().id(),
             );
 
-            if let SurfaceRole::Toplevel(Some(toplevel)) = &mut *role {
-                if let Some(d) = &mut toplevel.decoration.satellite {
+            if let SurfaceRole::Toplevel(Some(toplevel)) = &*role {
+                if let Some(d) = &toplevel.decoration.satellite {
                     let surface_width = (width as f64 / scale_factor.0) as i32;
-                    if d.draw_decorations(&state.world, surface_width, scale_factor.0 as f32) {
+                    if d.will_draw_decorations(surface_width) {
                         height = height
                             .saturating_sub(
                                 (DecorationsDataSatellite::TITLEBAR_HEIGHT as f64 * scale_factor.0)
@@ -341,7 +347,7 @@ impl SurfaceEvents {
             };
 
             drop(query);
-            update_surface_viewport(state.world.query_one(target).unwrap());
+            update_surface_viewport(&state.world, state.world.query_one(target).unwrap());
         }
 
         let (surface, attach, callback) = state
@@ -457,15 +463,16 @@ impl SurfaceEvents {
 }
 
 pub(super) fn update_surface_viewport(
+    world: &World,
     mut surface_query: hecs::QueryOne<(
         &WindowData,
         &WpViewport,
         &SurfaceScaleFactor,
-        Option<&SurfaceRole>,
+        Option<&mut SurfaceRole>,
         &WlSurface,
     )>,
 ) {
-    let (window_data, viewport, scale_factor, role, surface) = surface_query.get().unwrap();
+    let (window_data, viewport, scale_factor, mut role, surface) = surface_query.get().unwrap();
     let dims = &window_data.attrs.dims;
     let size_hints = &window_data.attrs.size_hints;
 
@@ -474,37 +481,44 @@ pub(super) fn update_surface_viewport(
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
+
+    let mut toplevel_data = match &mut role {
+        Some(SurfaceRole::Toplevel(Some(data))) => Some(data),
+        _ => None,
+    };
+    if let Some(d) = toplevel_data
+        .as_mut()
+        .and_then(|d| d.decoration.satellite.as_deref_mut())
+    {
+        d.draw_decorations(world, width, scale_factor.0 as f32);
+    }
     debug!("{} viewport: {width}x{height}", surface.id());
+
     if let Some(hints) = size_hints {
-        let data = match &role {
-            Some(SurfaceRole::Toplevel(Some(data))) => data,
-            Some(SurfaceRole::Toplevel(None)) => {
-                warn!(
-                    "Trying to update size hints on {}, but toplevel role data is missing",
-                    surface.id()
-                );
-                return;
-            }
-            Some(SurfaceRole::Popup(_)) => {
-                // Popups don't have min/max size hints.
-                return;
-            }
-            None => {
-                warn!("No role set on {}.", surface.id());
-                return;
-            }
+        let Some(data) = toplevel_data else {
+            return;
+        };
+
+        let decorations_height = if data.decoration.satellite.is_some() {
+            DecorationsDataSatellite::TITLEBAR_HEIGHT
+        } else {
+            0
         };
 
         if let Some(min) = hints.min_size {
+            debug!(
+                "updated min height: {}",
+                (min.height as f64 / scale_factor.0) as i32 + decorations_height
+            );
             data.toplevel.set_min_size(
                 (min.width as f64 / scale_factor.0) as i32,
-                (min.height as f64 / scale_factor.0) as i32,
+                (min.height as f64 / scale_factor.0) as i32 + decorations_height,
             );
         }
         if let Some(max) = hints.max_size {
             data.toplevel.set_max_size(
                 (max.width as f64 / scale_factor.0) as i32,
-                (max.height as f64 / scale_factor.0) as i32,
+                (max.height as f64 / scale_factor.0) as i32 + decorations_height,
             );
         }
     }
@@ -620,7 +634,7 @@ impl Event for client::wl_pointer::Event {
                             .insert_one(target, CurrentSurface::Decoration(parent))
                             .unwrap();
                     } else {
-                        warn!("could not enter surface: stale surface");
+                        warn!("could not enter surface {}: stale surface", surface.id());
                     }
 
                     return;
@@ -672,7 +686,7 @@ impl Event for client::wl_pointer::Event {
                 if !surface.is_alive() {
                     return;
                 }
-                debug!("leaving surface ({serial})");
+                debug!("leaving surface ({})", surface.id());
                 if let Ok(CurrentSurface::Decoration(parent)) =
                     state.world.remove_one::<CurrentSurface>(target)
                 {
@@ -702,7 +716,10 @@ impl Event for client::wl_pointer::Event {
                     return;
                 }
                 {
-                    let surface = state.world.get::<&CurrentSurface>(target).unwrap();
+                    let Ok(surface) = state.world.get::<&CurrentSurface>(target) else {
+                        warn!("could not motion on surface: stale surface");
+                        return;
+                    };
                     if let CurrentSurface::Decoration(parent) = &*surface {
                         decoration::handle_pointer_motion(state, *parent, surface_x, surface_y);
                         return;
@@ -731,10 +748,16 @@ impl Event for client::wl_pointer::Event {
                 }
                 let mut cmd = CommandBuffer::new();
 
-                let mut query = state
-                    .world
-                    .query_one::<(&WlPointer, &client::wl_seat::WlSeat, &CurrentSurface)>(target)
-                    .unwrap();
+                let Ok(mut query) =
+                    state
+                        .world
+                        .query_one::<(&WlPointer, &client::wl_seat::WlSeat, &CurrentSurface)>(
+                            target,
+                        )
+                else {
+                    warn!("could not click on surface: stale surface");
+                    return;
+                };
 
                 let (server, seat, current_surface) = query.get().unwrap();
 
@@ -911,27 +934,41 @@ impl Event for client::wl_touch::Event {
             } => {
                 let mut cmd = CommandBuffer::new();
                 {
-                    let mut s_query = surface.data().copied().and_then(|key| {
-                        state
-                            .world
-                            .query_one::<(&WlSurface, &SurfaceScaleFactor)>(key)
+                    let connection = &mut state.connection;
+                    let world = &mut state.inner.world;
+                    let s_entity = surface.data().copied();
+                    let mut s_query = s_entity.and_then(|key| {
+                        world
+                            .query_one::<(&WlSurface, &SurfaceScaleFactor, &x::Window)>(key)
                             .ok()
                     });
-                    let Some((s_surface, s_factor)) = s_query.as_mut().and_then(|q| q.get()) else {
-                        return;
-                    };
-
-                    cmd.insert(target, (*s_factor,));
-                    let touch = state.world.get::<&WlTouch>(target).unwrap();
-                    touch.down(serial, time, s_surface, id, x * s_factor.0, y * s_factor.0);
+                    if let Some((s_surface, s_factor, window)) =
+                        s_query.as_mut().and_then(|q| q.get())
+                    {
+                        cmd.insert_one(target, *s_factor);
+                        connection.raise_to_top(*window);
+                        let touch = world.get::<&WlTouch>(target).unwrap();
+                        touch.down(serial, time, s_surface, id, x * s_factor.0, y * s_factor.0);
+                    } else if let Some(&DecorationMarker { parent }) = surface.data() {
+                        drop(s_query);
+                        let seat = {
+                            let seat =
+                                &*state.world.get::<&client::wl_seat::WlSeat>(target).unwrap();
+                            seat.clone()
+                        };
+                        decoration::handle_pointer_motion(state, parent, x, y);
+                        decoration::handle_pointer_click(state, parent, &seat, serial);
+                    }
                 }
                 cmd.run_on(&mut state.world);
             }
             Self::Motion { time, id, x, y } => {
-                let (touch, scale) = state
+                let Ok((touch, scale)) = state
                     .world
                     .query_one_mut::<(&WlTouch, &SurfaceScaleFactor)>(target)
-                    .unwrap();
+                else {
+                    return;
+                };
                 touch.motion(time, id, x * scale.0, y * scale.0);
             }
             _ => {
